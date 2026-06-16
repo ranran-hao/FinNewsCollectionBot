@@ -1,4 +1,4 @@
-# 福生无量天尊
+# 福生无量天尊 - 财经新闻智能推送（早间全球/晚间亚洲）
 from openai import OpenAI
 import feedparser
 import requests
@@ -8,8 +8,15 @@ import time
 import pytz
 import os
 
+# ============================================================
+# 配置区
+# ============================================================
+
 # OpenAI API Key
 openai_api_key = os.getenv("OPENAI_API_KEY")
+if not openai_api_key:
+    raise ValueError("环境变量 OPENAI_API_KEY 未设置，请在Github Actions中设置此变量！")
+
 # 从环境变量获取 Server酱 SendKeys
 server_chan_keys_env = os.getenv("SERVER_CHAN_KEYS")
 if not server_chan_keys_env:
@@ -18,46 +25,123 @@ server_chan_keys = server_chan_keys_env.split(",")
 
 openai_client = OpenAI(api_key=openai_api_key, base_url="https://api.deepseek.com/v1")
 
-# RSS源地址列表
-rss_feeds = {
-    "💲 华尔街见闻":{
-        "华尔街见闻":"https://dedicated.wallstreetcn.com/rss.xml",      
+# ============================================================
+# 早间 RSS 源（9:00 运行）— 以全球市场为主
+# ============================================================
+morning_feeds = {
+    "🌏 全球宏观": {
+        "BBC全球经济": "http://feeds.bbci.co.uk/news/business/rss.xml",
+        "路透社全球商业": "https://feeds.reuters.com/reuters/businessNews",
     },
-    "💻 36氪":{
-        "36氪":"https://36kr.com/feed",   
-        },
-    "🇨🇳 中国经济": {
-        "香港經濟日報":"https://www.hket.com/rss/china",
-        "东方财富":"http://rss.eastmoney.com/rss_partener.xml",
-        "百度股票焦点":"http://news.baidu.com/n?cmd=1&class=stock&tn=rss&sub=0",
-        "中新网":"https://www.chinanews.com.cn/rss/finance.xml",
-        "国家统计局-最新发布":"https://www.stats.gov.cn/sj/zxfb/rss.xml",
-    },
-      "🇺🇸 美国经济": {
-        "华尔街日报 - 经济":"https://feeds.content.dowjones.io/public/rss/WSJcomUSBusiness",
-        "华尔街日报 - 市场":"https://feeds.content.dowjones.io/public/rss/RSSMarketsMain",
-        "MarketWatch美股": "https://www.marketwatch.com/rss/topstories",
-        "ZeroHedge华尔街新闻": "https://feeds.feedburner.com/zerohedge/feed",
+    "💰 贵金属/能源/商品": {
+        "ZeroHedge": "https://feeds.feedburner.com/zerohedge/feed",
         "ETF Trends": "https://www.etftrends.com/feed/",
     },
-    "🌍 世界经济": {
-        "华尔街日报 - 经济":"https://feeds.content.dowjones.io/public/rss/socialeconomyfeed",
-        "BBC全球经济": "http://feeds.bbci.co.uk/news/business/rss.xml",
+    "🤖 AI/科技": {
+        "36氪": "https://36kr.com/feed",
+        "TechCrunch": "https://techcrunch.com/feed/",
+    },
+    "📈 美股市场": {
+        "MarketWatch": "https://www.marketwatch.com/rss/topstories",
     },
 }
 
-# 获取北京时间
-def today_date():
-    return datetime.now(pytz.timezone("Asia/Shanghai")).date()
+# ============================================================
+# 晚间 RSS 源（18:00 运行）— 以亚洲市场为主
+# ============================================================
+evening_feeds = {
+    "🇨🇳 中国财经": {
+        "华尔街见闻": "https://dedicated.wallstreetcn.com/rss.xml",
+        "东方财富": "http://rss.eastmoney.com/rss_partener.xml",
+        "36氪快讯": "https://36kr.com/feed-newsflash",
+        "虎嗅": "https://www.huxiu.com/rss/0.xml",
+    },
+    "💼 创投/一级市场": {
+        "36氪创投": "https://36kr.com/feed",
+        "投资界": "https://www.pedaily.cn/rss.xml",
+    },
+    "🇭🇰 港股/亚太": {
+        "香港经济日报": "https://www.hket.com/rss/china",
+        "MarketWatch": "https://www.marketwatch.com/rss/topstories",
+    },
+}
 
-# 爬取网页正文 (用于 AI 分析，但不展示)
+# ============================================================
+# 早间提示词 — 全球市场 + 贵金属/能源 + AI动态 + 科普
+# ============================================================
+MORNING_PROMPT = """你是一位面向普通投资者的财经科普编辑。请根据以下新闻内容完成两个部分：
+
+**一、新闻总结**
+- 按重要程度从高到低排列，重要新闻展开说明，次要新闻一句话带过
+- 每条新闻如果原始内容中包含具体时间，必须标明发生时间（如"6月16日早8点"），如果原文没有具体时间则不要编造
+- 重点关注以下领域：
+  1. 全球市场动态（美股、欧股、亚太盘前等）
+  2. 贵金属价格及近期走势对比（如有黄金、白银相关新闻）
+  3. 能源与原油价格动态（如有）
+  4. AI 大公司新闻（OpenAI、Google、微软、英伟达、Meta等如有相关动态）
+- 只报道新闻中明确提到的内容，不要编造数据、价格或事件
+
+**二、科普时间**
+- 从今日新闻中挑出 2-3 个最重要的专业概念或术语
+- 用通俗语言解释：这个概念是什么？为什么它重要？对普通人意味着什么？
+- 科普要和新闻自然衔接，不要生硬插入
+- 只科普确实重要且读者可能不熟悉的概念，常见词汇不用解释
+
+整体风格要求：信息量大但不啰嗦，像一位懂行的朋友在跟你聊财经，而不是干巴巴的研究报告。"""
+
+# ============================================================
+# 晚间提示词 — 亚洲市场 + 创投动态 + 科普
+# ============================================================
+EVENING_PROMPT = """你是一位面向普通投资者的财经科普编辑。请根据以下新闻内容完成两个部分：
+
+**一、新闻总结**
+- 按重要程度从高到低排列，重要新闻展开说明，次要新闻一句话带过
+- 每条新闻如果原始内容中包含具体时间，必须标明发生时间（如"6月16日下午3点"），如果原文没有具体时间则不要编造
+- 重点关注以下领域：
+  1. 亚洲/中国市场动态（A股、港股、政策等）
+  2. 一级市场大新闻（IPO、重大融资、并购等）
+  3. 创投圈重大事件（知名机构动向、明星创业公司融资等）
+  4. 重要产业政策和监管动态
+- 只报道新闻中明确提到的内容，不要编造数据、金额或事件
+
+**二、科普时间**
+- 从今日新闻中挑出 2-3 个最重要的专业概念或术语
+- 用通俗语言解释：这个概念是什么？为什么它重要？对普通人意味着什么？
+- 科普要和新闻自然衔接，不要生硬插入
+- 只科普确实重要且读者可能不熟悉的概念，常见词汇不用解释
+
+整体风格要求：信息量大但不啰嗦，像一位懂行的朋友在跟你聊财经，而不是干巴巴的研究报告。"""
+
+
+# ============================================================
+# 工具函数
+# ============================================================
+
+def get_beijing_time():
+    return datetime.now(pytz.timezone("Asia/Shanghai"))
+
+
+def get_period():
+    """根据北京时间判断早间还是晚间"""
+    hour = get_beijing_time().hour
+    return "morning" if hour < 14 else "evening"
+
+
+def get_period_label(period):
+    return "☀️ 早间" if period == "morning" else "🌙 晚间"
+
+
+def today_date():
+    return get_beijing_time().date()
+
+
 def fetch_article_text(url):
     try:
         print(f"📰 正在爬取文章内容: {url}")
         article = Article(url)
         article.download()
         article.parse()
-        text = article.text[:1500]  # 限制长度，防止超出 API 输入限制
+        text = article.text[:1500]
         if not text:
             print(f"⚠️ 文章内容为空: {url}")
         return text
@@ -65,7 +149,7 @@ def fetch_article_text(url):
         print(f"❌ 文章爬取失败: {url}，错误: {e}")
         return "（未能获取文章正文）"
 
-# 添加 User-Agent 头
+
 def fetch_feed_with_headers(url):
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
@@ -73,7 +157,6 @@ def fetch_feed_with_headers(url):
     return feedparser.parse(url, request_headers=headers)
 
 
-# 自动重试获取 RSS
 def fetch_feed_with_retry(url, retries=3, delay=5):
     for i in range(retries):
         try:
@@ -86,10 +169,11 @@ def fetch_feed_with_retry(url, retries=3, delay=5):
     print(f"❌ 跳过 {url}, 尝试 {retries} 次后仍失败。")
     return None
 
-# 获取RSS内容（爬取正文但不展示）
-def fetch_rss_articles(rss_feeds, max_articles=10):
+
+def fetch_rss_articles(rss_feeds, max_per_source=5):
+    """抓取所有 RSS 源的文章"""
     news_data = {}
-    analysis_text = ""  # 用于AI分析的正文内容
+    analysis_text = ""
 
     for category, sources in rss_feeds.items():
         category_content = ""
@@ -101,15 +185,14 @@ def fetch_rss_articles(rss_feeds, max_articles=10):
                 continue
             print(f"✅ {source} RSS 获取成功，共 {len(feed.entries)} 条新闻")
 
-            articles = []  # 每个source都需要重新初始化列表
-            for entry in feed.entries[:5]:
+            articles = []
+            for entry in feed.entries[:max_per_source]:
                 title = entry.get('title', '无标题')
                 link = entry.get('link', '') or entry.get('guid', '')
                 if not link:
                     print(f"⚠️ {source} 的新闻 '{title}' 没有链接，跳过")
                     continue
 
-                # 爬取正文用于分析（不展示）
                 article_text = fetch_article_text(link)
                 analysis_text += f"【{title}】\n{article_text}\n\n"
 
@@ -123,27 +206,21 @@ def fetch_rss_articles(rss_feeds, max_articles=10):
 
     return news_data, analysis_text
 
-# AI 生成内容摘要（基于爬取的正文）
-def summarize(text):
+
+def summarize(text, prompt):
+    """调用 AI 生成新闻总结+科普"""
     completion = openai_client.chat.completions.create(
         model="deepseek-chat",
         messages=[
-            {"role": "system", "content": """
-             你是一名专业的财经新闻分析师，请根据以下新闻内容，按照以下步骤完成任务：
-             1. 提取新闻中涉及的主要行业和主题，找出近1天涨幅最高的3个行业或主题，以及近3天涨幅较高且此前2周表现平淡的3个行业/主题。（如新闻未提供具体涨幅，请结合描述和市场情绪推测热点）
-             2. 针对每个热点，输出：
-                - 催化剂：分析近期上涨的可能原因（政策、数据、事件、情绪等）。
-                - 复盘：梳理过去3个月该行业/主题的核心逻辑、关键动态与阶段性走势。
-                - 展望：判断该热点是短期炒作还是有持续行情潜力。
-             3. 将以上分析整合为一篇1500字以内的财经热点摘要，逻辑清晰、重点突出，适合专业投资者阅读。
-             """},
+            {"role": "system", "content": prompt},
             {"role": "user", "content": text}
         ]
     )
     return completion.choices[0].message.content.strip()
 
-# 发送微信推送
+
 def send_to_wechat(title, content):
+    """通过 Server酱 推送到微信"""
     for key in server_chan_keys:
         url = f"https://sctapi.ftqq.com/{key}.send"
         data = {"title": title, "desp": content}
@@ -154,20 +231,41 @@ def send_to_wechat(title, content):
             print(f"❌ 推送失败: {key}, 响应：{response.text}")
 
 
+# ============================================================
+# 主程序
+# ============================================================
+
 if __name__ == "__main__":
     today_str = today_date().strftime("%Y-%m-%d")
+    period = get_period()
+    period_label = get_period_label(period)
 
-    # 每个网站获取最多 5 篇文章
-    articles_data, analysis_text = fetch_rss_articles(rss_feeds, max_articles=5)
-    
-    # AI生成摘要
-    summary = summarize(analysis_text)
+    print(f"🕐 当前为北京时间 {get_beijing_time().strftime('%H:%M')}，模式：{period_label}")
 
-    # 生成仅展示标题和链接的最终消息
-    final_summary = f"📅 **{today_str} 财经新闻摘要**\n\n✍️ **今日分析总结：**\n{summary}\n\n---\n\n"
+    # 根据时段选择新闻源和提示词
+    if period == "morning":
+        rss_feeds = morning_feeds
+        prompt = MORNING_PROMPT
+        period_desc = "全球市场 | 贵金属/能源 | AI动态"
+    else:
+        rss_feeds = evening_feeds
+        prompt = EVENING_PROMPT
+        period_desc = "亚洲/中国市场 | 创投/一级市场"
+
+    # 抓取新闻
+    articles_data, analysis_text = fetch_rss_articles(rss_feeds, max_per_source=5)
+
+    # AI 生成总结+科普
+    summary = summarize(analysis_text, prompt)
+
+    # 组装最终推送内容
+    final_summary = f"📅 **{today_str} {period_label}财经日报**\n\n"
+    final_summary += f"📡 本期重点：{period_desc}\n\n"
+    final_summary += f"---\n\n{summary}\n\n---\n\n"
+    final_summary += "📎 **新闻链接**\n\n"
     for category, content in articles_data.items():
         if content.strip():
-            final_summary += f"## {category}\n{content}\n\n"
+            final_summary += f"**{category}**\n{content}\n\n"
 
-    # 推送到多个server酱key
-    send_to_wechat(title=f"📌 {today_str} 财经新闻摘要", content=final_summary)
+    # 推送
+    send_to_wechat(title=f"📌 {today_str} {period_label}财经日报", content=final_summary)
